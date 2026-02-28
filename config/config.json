@@ -1,0 +1,19 @@
+{
+  "api": {
+    "base_url": "https://api.vectorengine.ai/v1",
+    "api_key": "",
+    "model": "glm-4-flash",
+    "timeout": 30,
+    "max_retries": 3
+  },
+  "extraction": {
+    "confidence_threshold_high": 0.8,
+    "confidence_threshold_low": 0.5,
+    "max_candidate_regions": 5,
+    "context_window_size": 200
+  },
+  "processing": {
+    "max_workers": 4,
+    "batch_size": 100
+  }
+}
