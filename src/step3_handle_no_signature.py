@@ -70,14 +70,23 @@ def main():
             complex_data.append(row_dict)
             continue
         
-        candidate_text = SignatureLocator.extract_context(full_text, positions, window_size)
+        # 获取配置：是否使用全文
+        use_full_text_config = config.get('extraction.ai_text_length.no_signature', -1)
         
-        if len(candidate_text) > 1000:
-            stats['too_complex'] += 1
-            row_dict = row.to_dict()
-            row_dict['原因'] = f'候选文本过长({len(candidate_text)}字)'
-            complex_data.append(row_dict)
-            continue
+        if use_full_text_config == -1:
+            # 使用全文
+            candidate_text = full_text
+            print(f"  第{idx+1}条: 使用全文({len(candidate_text)}字)")
+        else:
+            # 使用智能搜索的候选区域
+            candidate_text = SignatureLocator.extract_context(full_text, positions, window_size)
+            
+            if len(candidate_text) > 1000:
+                stats['too_complex'] += 1
+                row_dict = row.to_dict()
+                row_dict['原因'] = f'候选文本过长({len(candidate_text)}字)'
+                complex_data.append(row_dict)
+                continue
         
         if use_ai:
             try:

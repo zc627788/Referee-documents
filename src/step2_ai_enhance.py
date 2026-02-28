@@ -1,5 +1,6 @@
 """
-阶段2：AI增强 - 处理低置信度文书
+阶段2：AI处理 - 处理所有有落款的文书（高置信度+低置信度）
+根据置信度使用不同文本长度：高置信度500字，低置信度1000字
 使用GLM-4-Flash进行智能提取
 """
 import argparse
@@ -7,11 +8,13 @@ import time
 from pathlib import Path
 from tqdm import tqdm
 from core import Config, AIExtractor, load_csv, persons_to_dict_row, save_csv, print_statistics
+import pandas as pd
 
 
 def main():
-    parser = argparse.ArgumentParser(description='阶段2：AI增强提取')
-    parser.add_argument('--input', type=str, default='data/temp/stage1_low_confidence.csv', help='输入CSV文件路径')
+    parser = argparse.ArgumentParser(description='阶段2：AI处理所有有落款的文书')
+    parser.add_argument('--high-conf-input', type=str, default='data/temp/stage1_high_confidence.csv', help='高置信度CSV')
+    parser.add_argument('--low-conf-input', type=str, default='data/temp/stage1_low_confidence.csv', help='低置信度CSV')
     parser.add_argument('--output-dir', type=str, default='data/temp', help='输出目录')
     parser.add_argument('--delay', type=float, default=0.5, help='API调用间隔（秒）')
     args = parser.parse_args()
@@ -23,11 +26,37 @@ def main():
         print("请在 config/.env 文件中设置 API_KEY")
         return
     
-    print(f"读取文件: {args.input}")
-    df = load_csv(args.input)
+    # 读取高置信度和低置信度文件
+    all_data = []
+    
+    high_conf_path = Path(args.high_conf_input)
+    low_conf_path = Path(args.low_conf_input)
+    
+    if high_conf_path.exists():
+        df_high = load_csv(str(high_conf_path))
+        df_high['原始置信度'] = 'high'
+        all_data.append(df_high)
+        print(f"读取高置信度: {len(df_high)} 条")
+    
+    if low_conf_path.exists():
+        df_low = load_csv(str(low_conf_path))
+        df_low['原始置信度'] = 'low'
+        all_data.append(df_low)
+        print(f"读取低置信度: {len(df_low)} 条")
+    
+    if not all_data:
+        print("错误：没有找到输入文件")
+        return
+    
+    df = pd.concat(all_data, ignore_index=True)
     
     if '落款区域' not in df.columns:
         raise ValueError("输入文件缺少'落款区域'列")
+    
+    # 获取文本长度配置
+    text_length_config = config.get('extraction.ai_text_length', {})
+    high_length = text_length_config.get('high_confidence', 500)
+    low_length = text_length_config.get('low_confidence', 1000)
     
     ai_extractor = AIExtractor(config)
     
@@ -36,15 +65,30 @@ def main():
     
     stats = {
         'total': len(df),
+        'high_conf_processed': 0,
+        'low_conf_processed': 0,
         'ai_success': 0,
         'ai_failed': 0
     }
     
-    print(f"开始AI增强处理 {len(df)} 条文书...")
+    print(f"\n开始AI处理 {len(df)} 条有落款的文书...")
     print(f"使用模型: {config.api_config['model']}")
+    print(f"高置信度文本长度: {high_length}字")
+    print(f"低置信度文本长度: {low_length}字")
     
     for idx, row in tqdm(df.iterrows(), total=len(df), desc="AI处理中"):
+        original_conf = row.get('原始置信度', 'low')
         signature_area = str(row['落款区域'])
+        
+        # 根据原始置信度截取不同长度
+        if original_conf == 'high':
+            stats['high_conf_processed'] += 1
+            if high_length > 0:
+                signature_area = signature_area[-high_length:]
+        else:
+            stats['low_conf_processed'] += 1
+            if low_length > 0:
+                signature_area = signature_area[-low_length:]
         
         try:
             persons = ai_extractor.extract(signature_area)
@@ -89,9 +133,13 @@ def main():
     
     success_rate = stats['ai_success'] / stats['total'] * 100 if stats['total'] > 0 else 0
     print(f"\nAI提取成功率: {success_rate:.1f}%")
+    print(f"高置信度处理: {stats['high_conf_processed']} 条")
+    print(f"低置信度处理: {stats['low_conf_processed']} 条")
     
-    estimated_cost = stats['total'] * 500 * 0.18 / 1000000
-    print(f"预估成本: {estimated_cost:.2f} 元")
+    # 估算成本
+    avg_chars = (stats['high_conf_processed'] * high_length + stats['low_conf_processed'] * low_length) / stats['total'] if stats['total'] > 0 else 0
+    estimated_cost = stats['total'] * avg_chars * 0.18 / 1000000
+    print(f"预估成本: {estimated_cost:.4f} 元")
 
 
 if __name__ == "__main__":

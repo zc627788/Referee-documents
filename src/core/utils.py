@@ -1,7 +1,13 @@
 import pandas as pd
 from pathlib import Path
 from typing import List
-from ..models import Person
+import sys
+
+try:
+    from ..models import Person
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from models import Person
 
 
 def persons_to_dict_row(persons: List[Person], file_name: str, index: int, method: str = '', confidence: float = 0.0) -> dict:

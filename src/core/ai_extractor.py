@@ -2,8 +2,16 @@ import json
 import re
 import requests
 from typing import List
-from .config import Config
-from ..models import Person
+import sys
+from pathlib import Path
+
+try:
+    from .config import Config
+    from ..models import Person
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from core.config import Config
+    from models import Person
 
 
 class AIExtractor:

@@ -10,7 +10,12 @@
     "confidence_threshold_high": 0.8,
     "confidence_threshold_low": 0.5,
     "max_candidate_regions": 5,
-    "context_window_size": 200
+    "context_window_size": 200,
+    "ai_text_length": {
+      "high_confidence": 500,
+      "low_confidence": 1000,
+      "no_signature": -1
+    }
   },
   "processing": {
     "max_workers": 4,

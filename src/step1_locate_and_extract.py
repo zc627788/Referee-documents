@@ -84,15 +84,15 @@ def main():
     
     if high_confidence_data:
         save_csv(high_confidence_data, str(high_conf_path))
-        print(f"✓ 高置信度结果: {high_conf_path}")
+        print(f"[OK] 高置信度结果: {high_conf_path}")
     
     if low_confidence_data:
         save_csv(low_confidence_data, str(low_conf_path))
-        print(f"✓ 低置信度结果: {low_conf_path}")
+        print(f"[OK] 低置信度结果: {low_conf_path}")
     
     if no_signature_data:
         save_csv(no_signature_data, str(no_sig_path))
-        print(f"✓ 无落款结果: {no_sig_path}")
+        print(f"[OK] 无落款结果: {no_sig_path}")
     
     print_statistics(stats)
     
