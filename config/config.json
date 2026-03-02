@@ -1,24 +1,15 @@
 {
   "api": {
-    "base_url": "https://api.vectorengine.ai/v1",
+    "base_url": "https://open.bigmodel.cn/api/paas/v4",
     "api_key": "",
     "model": "glm-4-flash",
     "timeout": 30,
-    "max_retries": 3
-  },
-  "extraction": {
-    "confidence_threshold_high": 0.8,
-    "confidence_threshold_low": 0.5,
-    "max_candidate_regions": 5,
-    "context_window_size": 200,
-    "ai_text_length": {
-      "high_confidence": 500,
-      "low_confidence": 1000,
-      "no_signature": -1
-    }
+    "max_retries": 3,
+    "concurrency": 10
   },
   "processing": {
-    "max_workers": 4,
-    "batch_size": 100
+    "chunk_size": 5000,
+    "tail_length": 1500,
+    "confidence_threshold": 0.5
   }
 }

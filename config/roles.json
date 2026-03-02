@@ -1,0 +1,101 @@
+{
+    "_comment": "落款角色字典，priority越小优先级越高，长名优先匹配避免截断",
+    "roles": [
+        {
+            "name": "代理审判长",
+            "priority": 1
+        },
+        {
+            "name": "审判长",
+            "priority": 1
+        },
+        {
+            "name": "代理审判员",
+            "priority": 2
+        },
+        {
+            "name": "助理审判员",
+            "priority": 2
+        },
+        {
+            "name": "审判员",
+            "priority": 3
+        },
+        {
+            "name": "人民陪审员",
+            "priority": 3
+        },
+        {
+            "name": "合议庭成员",
+            "priority": 3
+        },
+        {
+            "name": "陪审员",
+            "priority": 3
+        },
+        {
+            "name": "代理书记员",
+            "priority": 4
+        },
+        {
+            "name": "代书记员",
+            "priority": 4
+        },
+        {
+            "name": "书记员",
+            "priority": 4
+        },
+        {
+            "name": "首席仲裁员",
+            "priority": 5
+        },
+        {
+            "name": "主审法官",
+            "priority": 5
+        },
+        {
+            "name": "执行法官",
+            "priority": 5
+        },
+        {
+            "name": "执行员",
+            "priority": 5
+        },
+        {
+            "name": "副主任",
+            "priority": 6
+        },
+        {
+            "name": "主任",
+            "priority": 6
+        },
+        {
+            "name": "副院长",
+            "priority": 6
+        },
+        {
+            "name": "院长",
+            "priority": 6
+        },
+        {
+            "name": "副庭长",
+            "priority": 6
+        },
+        {
+            "name": "庭长",
+            "priority": 6
+        },
+        {
+            "name": "仲裁员",
+            "priority": 7
+        },
+        {
+            "name": "法官",
+            "priority": 7
+        },
+        {
+            "name": "法警",
+            "priority": 8
+        }
+    ]
+}
