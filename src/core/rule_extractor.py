@@ -1,12 +1,14 @@
 """
-规则提取器 v4.0 (纯结构物理切片法)
-抛弃自然语言分词(Jieba)猜测词性的不确定性，转而利用法律文书严格的排版坐标，
-通过【角色锚点->长度限制前缀->清洁->百家姓验证】进行提取，彻底解决错字、漏字、加字问题。
+规则提取器 v5.0 (全文扫描 + 边界判断 + AI队列)
+不再依赖落款定位，直接扫描全文中所有角色关键词，用边界字符判断姓名确定性。
+  - 确定（名字后是空白/标点/文末）→ 直接写入结果
+  - 不确定（名字后是中文字符）→ 放入 AI 队列
 """
 import re
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Optional
+from dataclasses import dataclass
 import sys
 
 try:
@@ -16,29 +18,16 @@ except ImportError:
     from models import Person
 
 
-# ── 水印与附录拦截词（直接斩断长文本）──────────────────
-_APPENDIX_WORDS = ['本案裁决所依据',
-                   '百度搜索', '马克数据', 'macrodat', '微信公众',
-                   'www.', '更多数据', '关注公众号']
-_STOP_WORDS = [
-    '来源', '来自', '关注', '微信', '马克', '更多', '数据', '附法', '提供', '查询', '提示',
-    '校对', '说明', '打印', '此件', '扫描', '复印', '公众号', '附件', '附一', '附二',
-    '附三', '附：', '附言', '附带', '附注', '附本', '法律', '担任', '速录', '宣布', '休庭', '特别',
-    '授权', '联系', '电话', '地址', '条文', '适用', '相关', '正当', '行使', '二〇', '二0', '二O',
-    '一月', '二月', '三月', '四月', '五月', '六月', '七月', '八月', '九月', '十月', '十一月', '十二月',
-    '【', '[', '(', '（', '搜索', '搜到', '搜出',
-    '提交', '申请', '上诉', '被诉', '原告', '被告', '本院', '本案',
-    '查明', '查清', '事实', '裁定', '判决', '受理', '人民法院', '知识产权',
-    '分别', '根据', '依照', '执行', '复议', '上述', '以上', '以下', '由于', '经审查', '经审理', '经查', '指出',
-    '审理', '审查', '代理', '代书', '代审', '提醒', '提出', '市区', '镇党',
-    '危害', '见习', '实习', '上列', '下列', '如下', '须知', '以下',
-    '经办人', '附录', '附页', '相关法律',
-]
+# ── 边界字符集 ──────────────────────────────────────────
+# 名字后面紧跟这些字符 → 100%确定名字已结束
+_BOUNDARY_CHARS = frozenset(
+    ' \t\n\r\u3000\xa0'                     # 空白类
+    '，。、；：？！""''（）《》【】〈〉｛｝'    # 中文标点
+    ',.;:?!()[]{}/<>"\''                    # 英文标点
+    '\r\n'                                   # 换行
+)
 
-# ── 年份停止正则（如「二〇一六」「二０一六」「二O一六」等）────────
-_YEAR_RE = re.compile(r'(?:一九|二[〇０0OＯΟО○][一二三四五六七八九十\d]{2}\s*年|20[0-9]{2}\s*年)')
-
-# ── 无效词黑名单（用于排除碰巧就在法官后面的2字动名词，防止被误认为名字）──
+# ── 无效词黑名单（碰巧出现的2字动名词，不是人名）──
 INVALID_WORDS = frozenset({
     '本院', '法院', '法庭', '人民', '公诉', '被告', '原告',
     '审判', '书记', '陪审', '执行', '合议', '仲裁',
@@ -59,29 +48,19 @@ INVALID_WORDS = frozenset({
     '宣布休庭', '法律条文', '特别授权', '适用法', '正当行',
     '提醒', '提出', '经向', '经审', '经本院', '爱民之心', '上述事实',
     '危害', '上列', '下列', '见习', '须知',
-    # v4.1补充：避免“法官都有一颗公正的心”等句子碎片被误提
     '公正', '都有', '有一', '希望', '应当', '必须', '应该', '能够',
     '一颗', '之心', '心态', '态度', '精神', '品德', '信念',
     '做到', '实现', '保障', '保护', '维护', '服务',
     '都有一', '都希望', '都应当', '都必须', '都能够', '都有一颗',
-    
-    # v4.2补充：其它常见动名词汇（首字在百家姓中容易被误提）
     '劳动', '需要', '进行', '要求', '同意', '听取', '责令', '征收',
     '其它', '其它事', '其他', '提出申请', '依法审', '依法作',
+    '仲裁委', '仲裁委员', '成立仲', '符合法',
 })
-
-# ── 尾字粘连黑名单（提取的名字末字若是这些字→裁剪掉）─────────────
-# 极度精简，避免误伤（“法”不能放→“巴鑫法”，“本”不能放→“卢成本”，“代”不能放→“杨代”）
-_BAD_TAIL_CHARS = frozenset(
-    '附另打搜及即亦注申引等党兼'
-)
 
 # ── 首字黑名单 ─────────────────────────────────────────
 _DIGIT_CHARS = frozenset('一二三四五六七八九十零〇')
 
-
-# ── 绝版硬核：百家姓与少数民族首字字典 ───────────────────
-# 囊括绝大数常见姓氏，防止截取到 "支持"、"通过" 等2字动词
+# ── 百家姓与少数民族首字字典 ───────────────────────────
 COMMON_SURNAMES = frozenset(
     "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜戚谢邹喻"
     "柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳酆鲍史唐费廉岑薛雷贺倪汤"
@@ -97,16 +76,12 @@ COMMON_SURNAMES = frozenset(
     "郭南门呼延归海羊舌微生岳帅缑亢况郈有琴梁丘左丘东门西门商牟佘佴伯赏南宫墨"
     "哈谯笪年爱阳佟第五言福"
     "曾艾申肖衣隋师晏温迟关丛游麦门库脱木妥"
-    # 以下为10万条实测中发现的百家姓缺失，按批次补充
     "冉谭拜朝介向圣吕希那达益央旺扎尼普格桑仁增"
     "覃铁付樊宝图迪练柴"
-    # 第3批：2205条exceptions全量分析补充
     "廖聂曲边牛綦楼庄过兰劳耿栗易苑农匡桂苟谌邸才"
     "阎逯岩弋侍虎郄鞠初冷惠简戈盘莎尚寿湛辛晁沃敖饶"
     "刀信税豆甲都瓦来相"
-    # 第4批：全量审计补充
     "牟岳商文延古吐涂仉闻官佟闫亢漆次"
-    # 少数民族常见首字
     "塔玛音丹吾"
 )
 
@@ -125,6 +100,53 @@ ETHNIC_CHARS = frozenset(
     "阿买吐巴欧次旦吾合扎吉热依努木库拉卡克麦买沙苏古斯帕买买提帕提玛"
     "哈斯木加孜布里亚特蒙古维吾尔藏科"
 )
+
+
+# ── 年份正则 ──
+_YEAR_RE = re.compile(r'(?:一九|二[〇０O0ＯΟО○零][一二三四五六七八九十\d]{2}\s*年|20[0-9]{2}\s*年)')
+
+
+def _is_boundary_text(tail: str) -> bool:
+    """
+    判断名字后面的文本是否构成边界。
+    tail: 名字后面的文本（已跳过排版空格）。
+    """
+    if not tail:
+        return True
+    c = tail[0]
+    # 1. 换行符
+    if c in '\n\r':
+        return True
+    # 2. 标点符号
+    if c in '，。、；：？！\u201c\u201d\u2018\u2019（）《》【】〈〉,.;:?!()[]{}/':
+        return True
+    # 3. 日期模式
+    if c in '二一〇零０012':
+        if _YEAR_RE.match(tail):
+            return True
+        if c in '12' and len(tail) >= 2 and tail[1].isdigit():
+            return True
+        if c == '二' and len(tail) >= 2 and tail[1] in '〇０0OＯΟО○零':
+            return True
+    # 4. 角色关键词
+    for r in ROLES:
+        if tail.startswith(r):
+            return True
+    # 5. 法律文书常见后缀
+    for suffix in ('附', '更多', '来源', '本案', '来自', '搜索', '百度', '马克',
+                   '微信', '关注', '公众', '此件', '法律', '条文'):
+        if tail.startswith(suffix):
+            return True
+    return False
+
+
+# ── 不确定片段结构 ──────────────────────────────────────
+@dataclass
+class UncertainSnippet:
+    """规则无法确定的片段，需要交给AI处理"""
+    role: str           # 角色词，如"审判员"
+    snippet: str        # 角色词+上下文片段（前5字+角色词+后30字）
+    position: int       # 角色词在原文中的位置
 
 
 def _load_roles() -> List[str]:
@@ -146,242 +168,246 @@ ROLES_SET: frozenset = frozenset(ROLES)
 
 
 class RuleExtractor:
-    """基于纯物理切片法 (Strict Span) 的终端规则提取器"""
+    """v5.0 全文扫描提取器：边界字符判断确定性"""
 
     @staticmethod
-    def extract(signature_text: str) -> Tuple[bool, float, List[Person]]:
-        """提取落款人员。Returns: (是否提取到人员, 置信度, 人员列表)"""
-        persons: List[Person] = []
-        seen: set = set()
+    def extract_fulltext(full_text: str) -> Tuple[List[Person], List[UncertainSnippet]]:
+        """
+        全文扫描提取。
+        Returns:
+            certain_persons: 确定的人员列表（名字后有明确边界）
+            uncertain_snippets: 不确定的片段列表（需AI处理）
+        """
+        certain: List[Person] = []
+        uncertain: List[UncertainSnippet] = []
+        seen_certain: set = set()
+        seen_uncertain: set = set()
 
-        # 1. 第一层清理：去除全角空格，整理常见排版
-        text = RuleExtractor._normalize(signature_text)
+        # 1. 基础清洗（统一空格、修复角色词内空格）
+        text = RuleExtractor._normalize(full_text)
 
-        # 2. 第二层清理：强力截肢附录长文（如果出现相关法律等词，直接丢掉后面的所有内容）
-        earliest_appendix = len(text)
-        for appendix in _APPENDIX_WORDS:
-            idx = text.find(appendix)
-            if 0 <= idx < earliest_appendix:
-                earliest_appendix = idx
-        text = text[:earliest_appendix]
-
-        # 3. 定位所有物理坐标锚点（角色 和 日期）
+        # 2. 定位所有角色关键词（长优先去重叠）
         markers = []
         for r in ROLES:
-            for m in re.finditer(r, text):
+            for m in re.finditer(re.escape(r), text):
                 markers.append({'val': r, 'start': m.start(), 'end': m.end()})
-                
-        for m in _YEAR_RE.finditer(text):
-            markers.append({'val': m.group(), 'start': m.start(), 'end': m.end()})
 
-        # 【关键】去重叠：当长短角色在同一位置重叠时（如"人民陪审员"与"陪审员"），
-        # 只保留更长的那个，避免名字被错误分配到短角色
         markers.sort(key=lambda x: (x['start'], -(x['end'] - x['start'])))
         deduped = []
         for mk in markers:
-            # 如果与上一个已保留的 marker 有重叠（即当前 start < 上一个 end），跳过
             if deduped and mk['start'] < deduped[-1]['end']:
                 continue
             deduped.append(mk)
         markers = deduped
 
-        # 4. 纯结构物理切片提取
-        for i, curr_marker in enumerate(markers):
-            if curr_marker['val'] not in ROLES_SET:
-                continue  # 如果当前锚点是日期，不能作为起始点，跳过
-                
-            role = curr_marker['val']
-            start_pos = curr_marker['end']
-            # 下一个锚点的开头，或者文章结尾
-            end_pos = markers[i+1]['start'] if i+1 < len(markers) else len(text)
-            
-            raw_segment = text[start_pos:end_pos].strip()
-            
-            # 【核心护城河】：限制前缀距离（截取角色后30字符，容纳含空格的名字）
-            search_area = raw_segment[:30].strip()
-            
-            # 清除乱码字符（全角字母如ＸＸ、问号?、特殊字符等）
-            search_area = re.sub(r'[\uff01-\uff5e]', '', search_area)  # 全角ASCII
-            search_area = re.sub(r'[?？\ufffd]+', '', search_area)
-            
-            # 【激进合并】：彻底合并汉字间的所有空格
-            # 先把连续空格替换为单空格，再循环合并汉字间单空格
-            search_area = re.sub(r'\s+', ' ', search_area).strip()
+        # 3. 对每个角色关键词做名字提取 + 边界判断
+        for i, mk in enumerate(markers):
+            role = mk['val']
+            role_end = mk['end']
+
+            # 取角色词后30字作为搜索区
+            raw_after = text[role_end:role_end + 30]
+
+            # 清理搜索区：去全角ASCII、乱码
+            search = re.sub(r'[\uff01-\uff5e]', '', raw_after)
+            search = re.sub(r'[?\ufffd]+', '', search)
+
+            # 合并汉字间空格
+            search = re.sub(r'\s+', ' ', search).strip()
             for _ in range(5):
-                new = re.sub(r'([\u4e00-\u9fa5]) ([\u4e00-\u9fa5])', r'\1\2', search_area)
-                if new == search_area:
+                new = re.sub(r'([\u4e00-\u9fa5]) ([\u4e00-\u9fa5])', r'\1\2', search)
+                if new == search:
                     break
-                search_area = new
-            # 合并后限制字符数（多人名在合并后紧凑排列）
-            search_area = search_area[:16]
-            
-            # 【全新围栏】：拦截一切可能是水印残段的截断词
-            earliest_stop = len(search_area)
-            for sw in _STOP_WORDS:
-                idx = search_area.find(sw)
-                if 0 <= idx < earliest_stop:
-                    earliest_stop = idx
-            search_area = search_area[:earliest_stop]
-            
-            # 去除冒号和常见标点，将标点转化为空格打断名字
-            search_area = re.sub(r'^[：:]+', ' ', search_area)
-            cleaned_area = re.sub(r'[、，。；：\.,;:（）\(\)《》<>\n\r]', ' ', search_area).strip()
-            if not cleaned_area:
+                search = new
+
+            # 去除开头冒号
+            search = re.sub(r'^[：:]+', '', search).strip()
+            if not search:
                 continue
 
-            # 按空格切分成多个候选组（处理“审判员 张三 李四”的情况）
-            candidates = cleaned_area.split()
-            
-            for cand in candidates:
-                # 剔除尾部粘连的错字（附、二、另 等等）
-                while len(cand) > 2 and cand[-1] in _BAD_TAIL_CHARS:
-                    cand = cand[:-1]
-                    
-                if len(cand) > 4:
-                    # 如果候选词依然很长（超过4个字），说明是没有空格的粘连词（如 张亚军因为本案...）
-                    # 我们尝试从开头截取 2-4 个符合规则的字作为名字，优先取3个字
-                    extracted = False
-                    for l in [3, 2, 4]:
-                        sub_cand = cand[:l]
-                        if RuleExtractor._is_valid_name_v4(sub_cand):
-                            key = (role, sub_cand)
-                            if key not in seen:
-                                seen.add(key)
-                                persons.append(Person(name=sub_cand, role=role))
-                            extracted = True
-                            break
-                    if extracted: continue
+            # 标点分割成候选组
+            parts = re.split(r'[、，。；：\.,;:（）\(\)《》<>\n\r]+', search)
+
+            for part in parts:
+                part = part.strip()
+                if not part:
+                    continue
+
+                # 按空格再拆
+                candidates = part.split()
+                for cand_raw in candidates:
+                    if not cand_raw:
+                        continue
+
+                    # 在原文中找到候选名字的确切位置，以判断其后的边界字符
+                    # cand_raw 可能很长（粘连），我们尝试提取2~4字的候选
+                    names_extracted = RuleExtractor._extract_candidates(cand_raw, role)
+                    if not names_extracted:
+                        # 没提取到合法名字 → 可能是无效文本或需AI判断
+                        # 只有当cand_raw的首字是百家姓/少民字时才放入AI队列
+                        if (len(cand_raw) >= 2
+                                and (cand_raw[0] in COMMON_SURNAMES or cand_raw[0] in ETHNIC_CHARS)
+                                and cand_raw not in INVALID_WORDS
+                                and cand_raw[:2] not in INVALID_WORDS):
+                            snippet_key = (role, cand_raw[:10])
+                            if snippet_key not in seen_uncertain:
+                                seen_uncertain.add(snippet_key)
+                                # 构建上下文片段
+                                ctx_start = max(0, mk['start'] - 5)
+                                ctx_end = min(len(text), role_end + 35)
+                                snippet_text = text[ctx_start:ctx_end]
+                                uncertain.append(UncertainSnippet(
+                                    role=role, snippet=snippet_text, position=mk['start']
+                                ))
+                        continue
+
+                    for name in names_extracted:
+                        # ── 核心：边界字符判断 ──────────
+                        # 在 raw_after 中找名字（允许字间空格）
+                        name_pattern = r'\s*'.join(re.escape(c) for c in name)
+                        match = re.search(name_pattern, raw_after)
+                        
+                        if match:
+                            pos = match.end()
+                            # 取名字后面的剩余文本（跳过排版空格）
+                            remaining = raw_after[pos:]
+                            tail = remaining.lstrip(' \t\u3000\xa0')
                             
-                # 针对 4 字名的精准后置纠偏（替代不可靠的 jieba）
-                # OCR导致姓名和随后的职位无空格粘连时，常形成"3字真名+1字职位前缀"
-                # 如果这个候选词刚好 4 个字，且最后一个字是典型的职务前置字，且前3个字是合法名字，直接修剪
-                if len(cand) == 4 and cand[-1] in '代本书法记长员兼一':
-                    cand3 = cand[:3]
-                    if RuleExtractor._is_valid_name_v4(cand3):
-                        cand = cand3
-                        
-                # 4字名末尾是"主审""实习"等2字角色/词 → 截掉后2字
-                if len(cand) == 4 and cand[2:] in ('主审', '注本', '主任', '实习'):
-                    cand2 = cand[:2]
-                    if RuleExtractor._is_valid_name_v4(cand2):
-                        cand = cand2
+                            if not tail:
+                                # 搜索区结尾 → 从原文往后看
+                                abs_pos = role_end + len(raw_after)
+                                while abs_pos < len(text) and text[abs_pos] in ' \t\u3000\xa0':
+                                    abs_pos += 1
+                                tail = text[abs_pos:abs_pos+10] if abs_pos < len(text) else ''
+                            
+                            is_certain = _is_boundary_text(tail)
+                        else:
+                            is_certain = False
 
-                # 4字候选：如果不是复姓也不是少数民族名，尝试拆成两个2字名
-                # 关键条件：两半的首字都必须在百家姓中，且不是少数民族字
-                if len(cand) == 4 and '·' not in cand:
-                    if (cand[:2] not in COMPOUND_SURNAMES
-                            and cand[0] not in ETHNIC_CHARS
-                            and cand[2] not in ETHNIC_CHARS):
-                        n1, n2 = cand[:2], cand[2:]
-                        if (n1[0] in COMMON_SURNAMES
-                                and n2[0] in COMMON_SURNAMES
-                                and RuleExtractor._is_valid_name_v4(n1)
-                                and RuleExtractor._is_valid_name_v4(n2)):
-                            for n in (n1, n2):
-                                key = (role, n)
-                                if key not in seen:
-                                    seen.add(key)
-                                    persons.append(Person(name=n, role=role))
-                            continue
+                        key = (role, name)
+                        if is_certain:
+                            if key not in seen_certain:
+                                seen_certain.add(key)
+                                certain.append(Person(name=name, role=role))
+                        else:
+                            if key not in seen_uncertain and key not in seen_certain:
+                                seen_uncertain.add(key)
+                                ctx_start = max(0, mk['start'] - 5)
+                                ctx_end = min(len(text), role_end + 35)
+                                snippet_text = text[ctx_start:ctx_end]
+                                uncertain.append(UncertainSnippet(
+                                    role=role, snippet=snippet_text, position=mk['start']
+                                ))
 
-                # 【终极验证】：如果符合中国人的名字规则，则采纳，放入列表
-                if RuleExtractor._is_valid_name_v4(cand):
-                    key = (role, cand)
-                    if key not in seen:
-                        seen.add(key)
-                        persons.append(Person(name=cand, role=role))
-                        
-        confidence = RuleExtractor._calc_confidence(persons)
-        return len(persons) > 0, confidence, persons
+        return certain, uncertain
 
-    # ── 内部方法 ──────────────────────────────────────────────────
+    @staticmethod
+    def _extract_candidates(raw: str, role: str) -> List[str]:
+        """从一个可能粘连的字符串中，提取所有合法姓名候选"""
+        names = []
+
+        if len(raw) <= 4:
+            # 短字符串：直接验证
+            # 4字名末尾是职务前置字 → 截3
+            if len(raw) == 4 and raw[-1] in '代本书法记长员兼一':
+                if RuleExtractor._is_valid_name(raw[:3]):
+                    names.append(raw[:3])
+                    return names
+            # 4字名末尾是双字角色词 → 截2
+            if len(raw) == 4 and raw[2:] in ('主审', '注本', '主任', '实习'):
+                if RuleExtractor._is_valid_name(raw[:2]):
+                    names.append(raw[:2])
+                    return names
+            # 4字候选：非复姓非少民 → 拆两个2字名
+            if len(raw) == 4 and '·' not in raw:
+                if (raw[:2] not in COMPOUND_SURNAMES
+                        and raw[0] not in ETHNIC_CHARS
+                        and raw[2] not in ETHNIC_CHARS):
+                    n1, n2 = raw[:2], raw[2:]
+                    if (n1[0] in COMMON_SURNAMES and n2[0] in COMMON_SURNAMES
+                            and RuleExtractor._is_valid_name(n1)
+                            and RuleExtractor._is_valid_name(n2)):
+                        names.extend([n1, n2])
+                        return names
+            # 整体验证
+            if RuleExtractor._is_valid_name(raw):
+                names.append(raw)
+                return names
+        else:
+            # 长字符串（>4字，粘连）：从开头截取2~4字
+            for l in [3, 2, 4]:
+                sub = raw[:l]
+                if RuleExtractor._is_valid_name(sub):
+                    names.append(sub)
+                    return names
+        return names
 
     @staticmethod
     def _normalize(text: str) -> str:
         """基础清洗"""
-        # 统一全半角空格
         text = re.sub(r'[\u3000\xa0]', ' ', text)
         text = text.replace('〇', '〇')
-        
-        # 去除乱码字符（如 ���）
         text = re.sub(r'[\ufffd]+', ' ', text)
-        
-        # 不再全文合并汉字间空格（这会导致姓名粘连），
-        # 只在角色关键词内部合并空格（如 "审 判 长" → "审判长"）
+        # 修复角色词内部空格（如"审 判 长" → "审判长"）
         for role in ROLES:
-            # 生成带空格的变体匹配（如 "审\\s*判\\s*长"）
             spaced = r'\s*'.join(re.escape(c) for c in role)
             text = re.sub(spaced, role, text)
-        
-        # 压缩3个及以上连续空格为双空格（保留双空格作为名字分隔符）
         text = re.sub(r'[ \t]{3,}', '  ', text)
         return text
 
     @staticmethod
-    def _is_valid_name_v4(name: str) -> bool:
-        """v4.0物理切片的姓氏守门员机制：用字典白名单阻挡任何提取到的非人名两字组合(如"许可")"""
+    def _is_valid_name(name: str) -> bool:
+        """姓名验证"""
         length = len(name)
         if length < 2 or length > 12:
             return False
-            
         if not re.match(r'^[\u4e00-\u9fa5·]+$', name):
             return False
-            
         if name in INVALID_WORDS or name in ROLES_SET:
             return False
-            
         if re.search(r'[年月日时〇零百千亿]', name):
             return False
-            
         if name[0] in _DIGIT_CHARS:
             return False
-
-        # 增加首尾字符的脏字阻断（覆盖所有地理及机构残体后缀，剔除州防止误杀"李宗州"）
-        if name[-1] in '搜附第页及即亦另打注申引结数内号字县市区省乡镇村庭厅局委办处股科':
+        if name[-1] in '搜附第页及即亦另打注申引结数内号字县市区省乡镇村庭厅局委办处股科院网':
             return False
         if name[0] in '第案本该其此各':
             return False
-        
-        # 拦截常见被误认为名字的地名（如温州等）
-        if name in {'温州', '苏州', '广陵', '通州', '海州', '荆州', '上海', '北京', '天津', '重庆',
-                    '宿州', '卓城', '广州', '深圳', '南京', '合肥', '长沙', '山东', '浙江', '云南',
-                    '乐陵', '卫辉'}:
+        # 地名拦截
+        if name[:2] in {'商丘', '郑州', '洛阳', '北京', '上海', '广州', '深圳', '天津', '重庆',
+                        '杭州', '成都', '武汉', '西安', '济南', '南阳', '平顶山', '新乡', '许昌',
+                        '漯河', '三门峡', '信阳', '周口', '驻马店', '济源', '安阳', '鹤壁', '濮阳',
+                        '温州', '苏州', '广陵', '通州', '海州', '荆州', '宿州', '卓城', '合肥',
+                        '长沙', '山东', '浙江', '云南', '乐陵', '卫辉', '宁陵', '夏邑', '虞城',
+                        '柘城', '睢县', '民权', '梁园', '睢阳'}:
             return False
-        
-        # 拦截明显不是名字的组合（含“之”字的成语不作人名，比如“爱民之心”）
-        if '之' in name and len(name) >= 3:
+        if '之' in name and length >= 3:
             return False
-            
-        # 拦截带有典型非人名前缀的3~4字组合（如“应当将”、“应当责”）
-        # 因为“应”、“依”是百家姓，所以需要拦截这些特定的词开头
         if name.startswith(('应当', '依法', '同意', '要求', '必须', '需要', '已经', '进行', '可以')):
             return False
-            
-        # 拦截带有典型非人名后缀的组合
         if name.endswith(('责任', '听取', '责令', '征收')):
             return False
-
-        # 少民·名或者藏维等常见开头字 -> 放宽通过
+        # 少民·名 → 放宽
         if '·' in name or name[0] in ETHNIC_CHARS:
             return True
-            
-        # 标准汉字名，最大长度限制为4字
         if length > 4:
             return False
-            
-        # 复合姓（如欧阳、司马等）
         if length >= 3 and name[:2] in COMPOUND_SURNAMES:
             return True
-            
-        # 百家姓首字认证
         if name[0] in COMMON_SURNAMES:
             return True
-            
         return False
+
+    # ── 保留旧接口供兼容 ──────────────────────────────────
+    @staticmethod
+    def extract(text: str) -> Tuple[bool, float, List[Person]]:
+        """兼容旧接口：只返回确定的人员"""
+        certain, _ = RuleExtractor.extract_fulltext(text)
+        conf = RuleExtractor._calc_confidence(certain)
+        return len(certain) > 0, conf, certain
 
     @staticmethod
     def _calc_confidence(persons: List[Person]) -> float:
-        """评估置信度"""
         if not persons:
             return 0.0
         score = 0.5
@@ -400,4 +426,3 @@ class RuleExtractor:
         if len(names) != len(set(names)):
             score *= 0.8
         return round(min(1.0, score), 3)
-

@@ -1,15 +1,15 @@
 {
   "api": {
-    "base_url": "https://open.bigmodel.cn/api/paas/v4",
-    "api_key": "",
-    "model": "glm-4-flash",
-    "timeout": 30,
+    "base_url": "https://vectorengine.ai/v1",
+    "api_key": "sk-DDqrrCYexk7pcBVqWXgApSB0rZgStXyuqz4gOCUjE4uIqbmj",
+    "model": "glm-4",
+    "timeout": 120,
     "max_retries": 3,
     "concurrency": 10
   },
   "processing": {
     "chunk_size": 5000,
-    "tail_length": 1500,
+    "ai_batch_size": 30,
     "confidence_threshold": 0.5
   }
 }

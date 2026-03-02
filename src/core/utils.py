@@ -22,25 +22,27 @@ def _load_role_columns() -> List[str]:
             with open(p, encoding='utf-8') as f:
                 data = json.load(f)
             ordered = sorted(data['roles'], key=lambda x: (x['priority'], -len(x['name'])))
-            return ['文件', '序号', '案号'] + [r['name'] for r in ordered]
-    return ['文件', '序号', '案号', '审判长', '审判员', '书记员']
+            return ['文件', '序号', '案号'] + [r['name'] for r in ordered] + ['来源']
+    return ['文件', '序号', '案号', '审判长', '审判员', '书记员', '来源']
 
 
 # 模块加载时确定固定列顺序
 ROLE_COLUMNS: List[str] = _load_role_columns()
 
 
-def persons_to_wide_row(persons: List[Person], file_name: str, index: int, case_no: str) -> Dict:
+def persons_to_wide_row(persons: List[Person], file_name: str, index: int, case_no: str, source: str = '规则') -> Dict:
     """
     将人员列表转为宽表字典行。
     同一角色多人时用 ; 拼接，如：'张三;李四'
+    source: 来源标识，如 '规则' 或 '规则+AI'
     """
     row: Dict = {'文件': file_name, '序号': index, '案号': case_no}
     groups: Dict[str, List[str]] = defaultdict(list)
     for p in persons:
         groups[p.role].append(p.name)
-    for col in ROLE_COLUMNS[3:]:  # 跳过 文件/序号/案号
+    for col in ROLE_COLUMNS[3:-1]:  # 跳过 文件/序号/案号 和最后的 来源
         row[col] = ';'.join(groups[col]) if col in groups else ''
+    row['来源'] = source
     return row
 
 
