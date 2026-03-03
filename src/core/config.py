@@ -50,6 +50,17 @@ class Config:
                 "max_retries": 3,
                 "concurrency": 10
             },
+            "extraction": {
+                "target_roles": [
+                    "审判长",
+                    "审判员",
+                    "代理审判长",
+                    "代理审判员",
+                    "书记员",
+                    "代理书记员",
+                    "助理审判员"
+                ]
+            },
             "processing": {
                 "chunk_size": 5000,
                 "tail_length": 1500,
@@ -82,7 +93,7 @@ class Config:
     
     @property
     def extraction_config(self):
-        return self._config['extraction']
+        return self._config.get('extraction', {})
     
     @property
     def processing_config(self):

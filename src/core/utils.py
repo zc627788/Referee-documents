@@ -16,32 +16,63 @@ except ImportError:
 
 def _load_role_columns() -> List[str]:
     """从 roles.json 读取列顺序"""
+    target_roles = None
+    try:
+        from .config import Config
+        config = Config()
+        extraction_cfg = config.get('extraction', {})
+        if 'target_roles' in extraction_cfg:
+            target_roles = extraction_cfg['target_roles']
+    except Exception:
+        target_roles = None
+
+    if target_roles:
+        return ['文件', '序号', '案号'] + list(target_roles) + ['flag', '来源']
+
     for base in [Path(__file__).parent.parent.parent, Path.cwd()]:
         p = base / 'config' / 'roles.json'
         if p.exists():
             with open(p, encoding='utf-8') as f:
                 data = json.load(f)
             ordered = sorted(data['roles'], key=lambda x: (x['priority'], -len(x['name'])))
-            return ['文件', '序号', '案号'] + [r['name'] for r in ordered] + ['来源']
-    return ['文件', '序号', '案号', '审判长', '审判员', '书记员', '来源']
+            return ['文件', '序号', '案号'] + [r['name'] for r in ordered] + ['flag', '来源']
+    return ['文件', '序号', '案号', '审判长', '审判员', '书记员', 'flag', '来源']
 
 
 # 模块加载时确定固定列顺序
 ROLE_COLUMNS: List[str] = _load_role_columns()
 
 
-def persons_to_wide_row(persons: List[Person], file_name: str, index: int, case_no: str, source: str = '规则') -> Dict:
+def persons_to_wide_row(persons: List[Person], file_name: str, index: int, case_no: str, source: str = '规则', ai_roles: List[str] = None) -> Dict:
     """
     将人员列表转为宽表字典行。
     同一角色多人时用 ; 拼接，如：'张三;李四'
     source: 来源标识，如 '规则' 或 '规则+AI'
+    ai_roles: 进入了 AI 队列的角色列表
     """
     row: Dict = {'文件': file_name, '序号': index, '案号': case_no}
     groups: Dict[str, List[str]] = defaultdict(list)
     for p in persons:
-        groups[p.role].append(p.name)
-    for col in ROLE_COLUMNS[3:-1]:  # 跳过 文件/序号/案号 和最后的 来源
-        row[col] = ';'.join(groups[col]) if col in groups else ''
+        if not p.role or not p.name:
+            continue
+        if p.name not in groups[p.role]:
+            groups[p.role].append(p.name)
+        
+    has_any_person = False
+    for col in ROLE_COLUMNS[3:-2]:  # 跳过 文件/序号/案号 和最后的 flag/来源
+        val = ';'.join(groups[col]) if col in groups else ''
+        row[col] = val
+        if val and str(val).strip() and str(val) != 'nan':
+            has_any_person = True
+            
+    if ai_roles:
+        roles_str = ', '.join(sorted(set(ai_roles)))
+        row['flag'] = f'需要AI处理: {roles_str}'
+    elif not has_any_person:
+        row['flag'] = 'NA'
+    else:
+        row['flag'] = ''
+        
     row['来源'] = source
     return row
 

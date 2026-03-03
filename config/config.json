@@ -7,9 +7,20 @@
     "max_retries": 3,
     "concurrency": 10
   },
+  "extraction": {
+    "target_roles": [
+      "审判长",
+      "审判员",
+      "代理审判长",
+      "代理审判员",
+      "书记员",
+      "代理书记员",
+      "助理审判员"
+    ]
+  },
   "processing": {
-    "chunk_size": 5000,
-    "ai_batch_size": 30,
+    "chunk_size": 8000,
+    "ai_batch_size": 100,
     "confidence_threshold": 0.5
   }
 }

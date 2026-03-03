@@ -30,12 +30,19 @@ from tqdm import tqdm
 # 把 src 目录加入路径
 sys.path.insert(0, str(Path(__file__).parent))
 
+# 确保控制台输出使用 UTF-8（Windows 终端兼容）
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 from core import (
     Config, RuleExtractor,
-    ProgressDB, persons_to_wide_row, IncrementalCSVWriter, ROLE_COLUMNS,
+    persons_to_wide_row, IncrementalCSVWriter, ROLE_COLUMNS,
 )
 from core.rule_extractor import UncertainSnippet
+from core.enhanced_rule_extractor import EnhancedRuleExtractor
 from models import Person
+
+# GLM4Extractor 延迟导入（只在Phase2需要时导入）
 
 
 # ─────────────────────────────────────────────────────────────
@@ -69,127 +76,32 @@ def _find_output_files(output_dir: Path):
 # ─────────────────────────────────────────────────────────────
 # AI 批量提取（token 打包 + 并发）
 # ─────────────────────────────────────────────────────────────
-def _ai_batch_extract(snippets: List[Dict], config: Config) -> Dict[str, Dict]:
+def _ai_batch_extract(snippets: List[Dict], config: Config, log_file: Path = None, response_dir: Path = None) -> Dict[str, Dict]:
     """
-    按 token 估算将片段打包成请求，返回 {snippet_id: {'name': '...', 'role': '...'}}
-    失败的片段不会出现在返回值中。
+    使用GLM-4批量提取（一次请求最多500条）
+    
+    Args:
+        snippets: 待处理的片段列表 [{'id': str, 'role': str, 'text': str}, ...]
+        config: 配置对象
+        log_file: AI处理日志文件路径
+        response_dir: 原始响应对话存储目录
+    
+    Returns:
+        提取结果映射 {snippet_id: {'name': str, 'role': str}}
     """
-    import httpx
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    import threading
-
-    api_key = config.get('api.api_key', '')
-    if not api_key:
-        print('[WARN] API key 未配置，跳过 AI 精修')
+    if not snippets:
         return {}
-
-    base_url = config.get('api.base_url', 'https://vectorengine.ai/v1')
-    model = config.get('api.model', 'glm-4')
-    timeout = config.get('api.timeout', 120)
-    concurrency = config.get('api.concurrency', 5)
-    max_retries = config.get('api.max_retries', 3)
-
-    MAX_INPUT_TOKENS = 80000
-    MAX_ITEMS_PER_REQUEST = 500
-    PROMPT_OVERHEAD = 200
-    PER_ITEM_OUTPUT_TOKENS = 25
-
-    def estimate_tokens(text: str) -> int:
-        cn = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-        return int(cn * 2 + (len(text) - cn) * 0.5)
-
-    # 按 token + 条数上限分组
-    mega_batches = []
-    current_batch, current_tokens = [], PROMPT_OVERHEAD
-    for s in snippets:
-        item_text = f'[ID:{s["id"]}] 角色:{s["role"]} 文本:"{s["text"]}"'
-        item_tokens = estimate_tokens(item_text) + PER_ITEM_OUTPUT_TOKENS
-        if (current_tokens + item_tokens > MAX_INPUT_TOKENS or len(current_batch) >= MAX_ITEMS_PER_REQUEST) and current_batch:
-            mega_batches.append(current_batch)
-            current_batch, current_tokens = [], PROMPT_OVERHEAD
-        current_batch.append(s)
-        current_tokens += item_tokens
-    if current_batch:
-        mega_batches.append(current_batch)
-
-    print(f'  打包: {len(snippets)} 条 -> {len(mega_batches)} 个API请求 '
-          f'(每请求 ~{len(snippets)//max(len(mega_batches),1)} 条)')
-
-    result_map = {}  # id -> {'name': ..., 'role': ...}
-    lock = threading.Lock()
-    errors = [0]
-    pbar = tqdm(total=len(snippets), desc='AI精修', unit='条', mininterval=1.0)
-
-    def process_mega_batch(batch):
-        items_text = '\n'.join([
-            f'{i+1}. [ID:{s["id"]}] 角色:{s["role"]} 文本:"{s["text"]}"'
-            for i, s in enumerate(batch)
-        ])
-        prompt = (
-            "以下是中国法律文书中的文本片段，每个片段包含一个角色关键词。\n"
-            "请提取该角色对应的人名（仅中国人姓名，2-4个汉字），也有可能包含少数民族姓名。\n"
-            "如果没有有效人名（如后续是机构名、动词等），返回null。\n\n"
-            f"{items_text}\n\n"
-            "严格按JSON数组返回，每条对应一个输入，不要输出任何其他文字：\n"
-            '[{"id":"对应ID","name":"姓名或null"}]'
-        )
-        max_out_tokens = len(batch) * PER_ITEM_OUTPUT_TOKENS + 100
-
-        for attempt in range(max_retries):
-            try:
-                with httpx.Client(timeout=timeout) as client:
-                    resp = client.post(
-                        f'{base_url}/chat/completions',
-                        headers={'Authorization': f'Bearer {api_key}',
-                                 'Content-Type': 'application/json'},
-                        json={
-                            'model': model,
-                            'messages': [{'role': 'user', 'content': prompt}],
-                            'temperature': 0.1,
-                            'max_tokens': max_out_tokens,
-                        }
-                    )
-                    resp.raise_for_status()
-                    content = resp.json()['choices'][0]['message']['content']
-                    json_match = re.search(r'\[.*\]', content, re.DOTALL)
-                    if json_match:
-                        ai_results = json.loads(json_match.group())
-                        id_to_role = {s['id']: s['role'] for s in batch}
-                        with lock:
-                            for r in ai_results:
-                                name = r.get('name')
-                                if name and name != 'null' and name != 'None' and name.strip():
-                                    sid = r.get('id', '')
-                                    result_map[sid] = {'name': name.strip(), 'role': id_to_role.get(sid, '')}
-                            pbar.update(len(batch))
-                        return True
-                    else:
-                        with lock:
-                            pbar.update(len(batch))
-                        return True  # 没有JSON但不算错误
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    time.sleep(3 * (attempt + 1))
-                else:
-                    with lock:
-                        errors[0] += 1
-                        pbar.update(len(batch))
-                    print(f'  [ERROR] 批次失败({len(batch)}条): {type(e).__name__}: {e}')
-                    return False
-        return False
-
-    if len(mega_batches) == 1:
-        process_mega_batch(mega_batches[0])
-    else:
-        with ThreadPoolExecutor(max_workers=min(concurrency, len(mega_batches))) as executor:
-            futures = [executor.submit(process_mega_batch, b) for b in mega_batches]
-            for f in as_completed(futures):
-                pass
-
-    pbar.close()
-    if errors[0]:
-        print(f'  [WARN] {errors[0]} 个请求失败')
-    print(f'  AI 提取到 {len(result_map)} 个有效人名')
+    
+    import datetime
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    # 延迟导入GLM4Extractor
+    from core.glm4_extractor import GLM4Extractor
+    extractor = GLM4Extractor(config)
+    
+    # 批量处理 (修复 Bug: 传入 log_file 和 response_dir)
+    result_map = extractor.extract_batch(snippets, log_file=log_file, response_dir=response_dir)
+    
     return result_map
 
 
@@ -203,7 +115,8 @@ def _merge_ai_results(result_csv: Path, queue_df: pd.DataFrame,
     existing_df = None
     if result_csv.exists() and result_csv.stat().st_size > 0:
         try:
-            existing_df = pd.read_csv(str(result_csv), encoding='utf-8-sig')
+            # 增加 low_memory=False 解决 DtypeWarning，统一转为字符串处理
+            existing_df = pd.read_csv(str(result_csv), encoding='utf-8-sig', low_memory=False)
         except:
             existing_df = None
 
@@ -231,19 +144,56 @@ def _merge_ai_results(result_csv: Path, queue_df: pd.DataFrame,
                 for p in ai_persons:
                     if p.role in existing_df.columns:
                         old_val = str(existing_df.at[df_idx, p.role]) if pd.notna(existing_df.at[df_idx, p.role]) else ''
-                        old_names = set(old_val.split(';')) if old_val else set()
+                        # 保持有序列表去重（避免 set 乱序，保证输出稳定）
+                        old_names = [n for n in old_val.split(';') if n] if old_val else []
                         if p.name not in old_names:
-                            old_names.discard('')
-                            old_names.add(p.name)
+                            old_names.append(p.name)
                             existing_df.at[df_idx, p.role] = ';'.join(old_names)
-                existing_df.at[df_idx, '来源'] = 'AI'
+                existing_df.at[df_idx, '来源'] = '规则+ai'
+                curr_flag = str(existing_df.at[df_idx, 'flag']) if pd.notna(existing_df.at[df_idx, 'flag']) else ''
+                
+                # 当前处理的角色集合
+                processed_roles = {p.role for p in ai_persons}
+                
+                if '需要AI处理:' in curr_flag:
+                    # 解析当前的待处理和已处理
+                    parts = curr_flag.split('已用ai处理:')
+                    needs_ai_part = parts[0].replace('需要AI处理:', '').strip()
+                    done_ai_part = parts[1].strip() if len(parts) > 1 else ''
+                    
+                    needs_roles = [r.strip() for r in needs_ai_part.split(',') if r.strip()]
+                    done_roles = [r.strip() for r in done_ai_part.split(',') if r.strip()]
+                    
+                    # 移除已处理的角色，加入已完成集合
+                    remaining_needs = [r for r in needs_roles if r not in processed_roles]
+                    new_done_roles = list(set(done_roles + list(processed_roles)))
+                    
+                    new_flag = ''
+                    if remaining_needs:
+                        new_flag += f"需要AI处理: {', '.join(remaining_needs)}"
+                    if new_done_roles:
+                        if new_flag: new_flag += " "
+                        new_flag += f"已用ai处理: {', '.join(new_done_roles)}"
+                        
+                    existing_df.at[df_idx, 'flag'] = new_flag.strip()
+                else:
+                    existing_df.at[df_idx, 'flag'] = f"已用ai处理: {', '.join(processed_roles)}"
+                
+                # 最终校验：如果合并后 7 个角色均为空，强制 NA
+                role_cols = [c for c in existing_df.columns if c not in ['文件', '序号', '案号', 'flag', '来源']]
+                vals = [str(existing_df.at[df_idx, c]) for c in role_cols if pd.notna(existing_df.at[df_idx, c])]
+                non_empty_vals = [v for v in vals if v.strip() and v.lower() != 'nan']
+                if not non_empty_vals:
+                    existing_df.at[df_idx, 'flag'] = 'NA'
+                
                 merged_count += 1
             else:
                 case_no_mask = queue_df[queue_df['snippet_id'].apply(
                     lambda x: str(x).startswith(f'{ridx}_'))]
                 case_no = str(case_no_mask.iloc[0]['案号']) if len(case_no_mask) > 0 else ''
-                result = persons_to_wide_row(ai_persons, file_label, row_num, case_no, source='AI')
-                existing_df = pd.concat([existing_df, pd.DataFrame([result])], ignore_index=True)
+                new_row = persons_to_wide_row(ai_persons, file_label, row_num, case_no, source='规则+ai')
+                new_row['flag'] = '已用ai处理'
+                existing_df = pd.concat([existing_df, pd.DataFrame([new_row])], ignore_index=True)
                 new_count += 1
 
         existing_df.to_csv(str(result_csv), index=False, encoding='utf-8-sig')
@@ -254,7 +204,9 @@ def _merge_ai_results(result_csv: Path, queue_df: pd.DataFrame,
             case_no_mask = queue_df[queue_df['snippet_id'].apply(
                 lambda x: str(x).startswith(f'{ridx}_'))]
             case_no = str(case_no_mask.iloc[0]['案号']) if len(case_no_mask) > 0 else ''
-            rows.append(persons_to_wide_row(ai_persons, file_label, ridx + 1, case_no, source='AI'))
+            new_row = persons_to_wide_row(ai_persons, file_label, ridx + 1, case_no, source='规则+ai')
+            new_row['flag'] = '已用ai处理'
+            rows.append(new_row)
             new_count += 1
         if rows:
             pd.DataFrame(rows).to_csv(str(result_csv), index=False, encoding='utf-8-sig')
@@ -276,33 +228,26 @@ def cmd_phase1(args):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    db_path    = output_dir / 'progress.sqlite'
     output_csv = output_dir / f'{file_name}_result.csv'
 
     config     = Config()
     chunk_size = config.get('processing.chunk_size', 5000)
-    db = ProgressDB(str(db_path))
-
-    # 续跑检测
-    existing = db.get_stats()
-    if existing['total'] > 0:
-        print(f"[续跑] 已有进度 -> done:{existing['done']}  "
-              f"pending_ai:{existing['pending_ai']}  "
-              f"no_signature:{existing['no_signature']}")
+    # 输出文件存在则覆盖（不再提供SQLite断点续跑）
+    ai_queue_csv = output_dir / f'{file_name}_ai_queue.csv'
+    if output_csv.exists():
+        output_csv.unlink()
+    if ai_queue_csv.exists():
+        ai_queue_csv.unlink()
 
     writer = IncrementalCSVWriter(str(output_csv), ROLE_COLUMNS)
 
-    exception_csv = output_dir / f'{file_name}_exceptions.csv'
-    exc_writer = IncrementalCSVWriter(str(exception_csv), ['文件', '序号', '案号', '标识'])
-
     # AI队列 — 带状态列
-    ai_queue_csv = output_dir / f'{file_name}_ai_queue.csv'
     AI_QUEUE_COLS = ['文件', '序号', '案号', '角色', '片段', '位置', 'snippet_id', '状态']
     ai_writer = IncrementalCSVWriter(str(ai_queue_csv), AI_QUEUE_COLS)
 
-    stats = dict(read=0, skipped=0, rule_ok=0, uncertain=0, no_role=0, empty_text=0)
-    batch_buf = []
-    BATCH_COMMIT = 2000
+    stats = dict(read=0, rule_ok=0, uncertain=0, no_role=0, empty_text=0,
+                 enhanced_extracted=0, enhanced_filtered=0)
+    seen_snippet_ids = set()
 
     print(f"\n{'='*60}")
     print(f"  Phase 1: 规则提取（全文扫描 + 边界判断）")
@@ -310,8 +255,7 @@ def cmd_phase1(args):
     print(f"  输入     : {input_path}")
     print(f"  提取结果 : {output_csv}")
     print(f"  AI队列   : {ai_queue_csv}")
-    print(f"  异常     : {exception_csv}")
-    print(f"  进度库   : {db_path}\n")
+    print("  断点续传 : 已关闭(SQLite未启用)\n")
 
     try:
         reader = pd.read_csv(
@@ -320,10 +264,13 @@ def cmd_phase1(args):
             encoding='utf-8',
             on_bad_lines='skip',
             usecols=lambda c: c in ['全文', '案号', '裁判日期', '法院'],
+            low_memory=False # 统一读取，防止 DtypeWarning
         )
         pbar = tqdm(desc='Phase 1 扫描', unit='条', mininterval=2.0)
 
         for chunk in reader:
+            result_rows = []
+            queue_rows = []
             for row in chunk.itertuples(index=True):
                 row_idx = row.Index
                 pbar.update(1)
@@ -332,94 +279,126 @@ def cmd_phase1(args):
                 if args.limit and stats['read'] > args.limit:
                     raise StopIteration
 
-                if db.is_processed(file_name, row_idx):
-                    stats['skipped'] += 1
-                    continue
-
                 full_text_raw = getattr(row, '全文', None)
                 case_no = str(getattr(row, '案号', '') or '')
 
                 # 空文本
                 if full_text_raw is None or (isinstance(full_text_raw, float) and str(full_text_raw) == 'nan'):
                     stats['empty_text'] += 1
-                    db.mark_no_signature(file_name, row_idx)
-                    exc_writer.append({'文件': file_label, '序号': row_idx + 1, '案号': case_no, '标识': '空文本'})
-                    batch_buf.append(1)
-                    if len(batch_buf) >= BATCH_COMMIT:
-                        db.commit()
-                        batch_buf.clear()
+                    result = persons_to_wide_row([], file_label, row_idx + 1, case_no, source='规则')
+                    result_rows.append(result)
                     continue
 
                 full_text = str(full_text_raw).strip()
                 if not full_text or full_text == 'nan':
                     stats['empty_text'] += 1
-                    db.mark_no_signature(file_name, row_idx)
-                    exc_writer.append({'文件': file_label, '序号': row_idx + 1, '案号': case_no, '标识': '空文本'})
-                    batch_buf.append(1)
-                    if len(batch_buf) >= BATCH_COMMIT:
-                        db.commit()
-                        batch_buf.clear()
+                    result = persons_to_wide_row([], file_label, row_idx + 1, case_no, source='规则')
+                    result_rows.append(result)
                     continue
 
                 # 全文扫描提取
                 certain, uncertain = RuleExtractor.extract_fulltext(full_text)
-
-                if certain:
-                    stats['rule_ok'] += 1
-                    result = persons_to_wide_row(certain, file_label, row_idx + 1, case_no, source='规则')
-                    writer.append(result)
-                    db.mark_done(file_name, row_idx, 'rule', 0.85, result)
-                elif not uncertain:
-                    stats['no_role'] += 1
-                    db.mark_no_signature(file_name, row_idx)
-                    exc_writer.append({'文件': file_label, '序号': row_idx + 1, '案号': case_no, '标识': '无角色词'})
-                else:
-                    stats['no_role'] += 1
-
-                # 收集不确定片段
+                has_any_role_terms = bool(certain) or bool(uncertain)
+                
+                # 先用增强规则处理不确定片段
+                enhanced_extracted = []  # 增强规则提取的人员
+                still_uncertain = []     # 仍需AI处理的片段
+                
                 if uncertain:
                     stats['uncertain'] += len(uncertain)
+                    
                     for u in uncertain:
+                        # 尝试用增强规则提取
+                        name = EnhancedRuleExtractor.try_extract(u.snippet, u.role)
+                        
+                        if name is None:
+                            # 仍不确定，稍后加入AI队列
+                            still_uncertain.append(u)
+                        elif name != "":
+                            # 增强规则提取到姓名
+                            enhanced_extracted.append(Person(name=name, role=u.role))
+                            stats['enhanced_extracted'] += 1
+                        else:
+                            # name == "" 表示确定无姓名
+                            stats['enhanced_filtered'] += 1
+                
+                # 合并所有提取到的人员
+                all_persons = certain + enhanced_extracted
+                ai_roles = [u.role for u in still_uncertain] if still_uncertain else None
+                
+                # 写入result
+                if all_persons or still_uncertain:
+                    if certain:
+                        stats['rule_ok'] += 1
+                    source = '规则+增强' if enhanced_extracted else '规则'
+                    result = persons_to_wide_row(all_persons, file_label, row_idx + 1, case_no, source=source, ai_roles=ai_roles)
+                    result_rows.append(result)
+                else:
+                    stats['no_role'] += 1
+                    result = persons_to_wide_row([], file_label, row_idx + 1, case_no, source='规则')
+                    result_rows.append(result)
+                
+                # 收集仍需AI处理的片段
+                if still_uncertain:
+                    for u in still_uncertain:
                         snippet_id = f"{row_idx}_{u.position}"
-                        ai_writer.append({
+                        if snippet_id in seen_snippet_ids:
+                            continue
+                        seen_snippet_ids.add(snippet_id)
+                        cleaned_snippet = RuleExtractor._clean_ai_snippet(u.snippet)
+                        queue_rows.append({
                             '文件': file_label, '序号': row_idx + 1,
                             '案号': case_no, '角色': u.role,
-                            '片段': u.snippet, '位置': u.position,
+                            '片段': cleaned_snippet, '位置': u.position,
                             'snippet_id': snippet_id, '状态': '待处理'
                         })
-
-                batch_buf.append(1)
-                if len(batch_buf) >= BATCH_COMMIT:
-                    db.commit()
-                    batch_buf.clear()
-
-        db.commit()
+            if result_rows:
+                writer.append_many(result_rows)
+            if queue_rows:
+                ai_writer.append_many(queue_rows)
         pbar.close()
 
     except StopIteration:
-        db.commit()
         pbar.close()
         print(f"\n[已达 limit={args.limit}，停止]")
     except KeyboardInterrupt:
-        db.commit()
         pbar.close()
-        print('\n[中断] 进度已保存，重新运行可从断点继续')
+        print('\n[中断] 未启用断点续传，请重新运行任务')
 
     # 统计
-    processed = stats['read'] - stats['skipped']
+    processed = stats['read']
     print('\n' + '-' * 60)
     print('Phase 1 完成')
     print('-' * 60)
     print(f'  读取总数   : {stats["read"]:>10,}')
-    print(f'  跳过(续跑) : {stats["skipped"]:>10,}')
     print(f'  本次处理   : {processed:>10,}')
     if processed:
         print(f'  确定提取   : {stats["rule_ok"]:>10,}  ({stats["rule_ok"]/processed*100:.1f}%)')
         print(f'  不确定片段 : {stats["uncertain"]:>10,}')
+        if stats["uncertain"] > 0:
+            print(f'    - 增强规则提取: {stats["enhanced_extracted"]:>6,}  ({stats["enhanced_extracted"]/stats["uncertain"]*100:.1f}%)')
+            print(f'    - 过滤无姓名  : {stats["enhanced_filtered"]:>6,}  ({stats["enhanced_filtered"]/stats["uncertain"]*100:.1f}%)')
         print(f'  空文本     : {stats["empty_text"]:>10,}  ({stats["empty_text"]/processed*100:.1f}%)')
         print(f'  无角色词   : {stats["no_role"]:>10,}  ({stats["no_role"]/processed*100:.1f}%)')
     print(f'  结果文件   : {output_csv}')
-    print(f'  AI队列     : {ai_queue_csv}  ({stats["uncertain"]} 条待处理)')
+    
+    # 统计AI队列实际数量
+    actual_ai_queue = 0
+    if ai_queue_csv.exists():
+        try:
+            queue_df = pd.read_csv(str(ai_queue_csv), encoding='utf-8-sig', low_memory=False)
+            actual_ai_queue = len(queue_df)
+        except:
+            pass
+    
+    if stats["uncertain"] > 0:
+        saved_pct = (stats["uncertain"] - actual_ai_queue) / stats["uncertain"] * 100
+        print(f'  AI队列     : {ai_queue_csv}')
+        print(f'    - 原始不确定: {stats["uncertain"]:>6,}')
+        print(f'    - 最终AI队列: {actual_ai_queue:>6,}')
+        print(f'    - 优化节省  : {stats["uncertain"] - actual_ai_queue:>6,}  (节省{saved_pct:.1f}%)')
+    else:
+        print(f'  AI队列     : 无待处理片段')
     print('-' * 60)
     if stats['uncertain'] > 0:
         print(f'\n[下一步] 运行 phase2 处理不确定片段:')
@@ -438,8 +417,8 @@ def cmd_phase2(args):
         print('  请先运行 phase1')
         sys.exit(1)
 
-    # 读取 AI 队列
-    queue_df = pd.read_csv(str(queue_csv), encoding='utf-8-sig')
+    # 读取 AI 队列（明确指定AI提取姓名为字符串类型）
+    queue_df = pd.read_csv(str(queue_csv), encoding='utf-8-sig', dtype={'AI提取姓名': str}, low_memory=False)
     if '状态' not in queue_df.columns:
         queue_df['状态'] = '待处理'
     if 'snippet_id' not in queue_df.columns:
@@ -459,12 +438,16 @@ def cmd_phase2(args):
         return
 
     file_label = str(pending.iloc[0]['文件'])
+    
+    # 创建AI处理日志文件
+    log_file = queue_csv.parent / f"{queue_csv.stem}_ai_log.txt"
 
     print(f"\n{'='*60}")
     print(f"  Phase 2: AI 精修")
     print(f"{'='*60}")
     print(f"  队列文件  : {queue_csv}")
     print(f"  结果文件  : {result_csv}")
+    print(f"  日志文件  : {log_file}")
     print(f"  待处理    : {len(pending)} 条\n")
 
     # 构建 snippets
@@ -477,21 +460,34 @@ def cmd_phase2(args):
         })
 
     config = Config()
-    ai_map = _ai_batch_extract(snippets, config)
+    
+    # 响应详情输出目录
+    response_dir = log_file.parent / "ai_responses"
+    
+    ai_map = _ai_batch_extract(snippets, config, log_file, response_dir)
 
-    # 更新队列状态
+    # 更新队列状态和AI提取姓名
     processed_ids = set(ai_map.keys())
     all_pending_ids = set(pending['snippet_id'].astype(str))
+    
+    # 确保'AI提取姓名'列存在
+    if 'AI提取姓名' not in queue_df.columns:
+        queue_df['AI提取姓名'] = ''
 
     for idx, row in queue_df.iterrows():
         sid = str(row['snippet_id'])
         if sid in processed_ids:
             queue_df.at[idx, '状态'] = '已处理'
+            # 记录AI提取的姓名
+            queue_df.at[idx, 'AI提取姓名'] = ai_map[sid]['name']
         elif sid in all_pending_ids and sid not in processed_ids:
             # 发给AI了但没返回结果 — 可能AI认为不是人名(null)或批次失败
             # 如果该 snippet 的批次没失败，说明AI返回了null → 标记为已处理
             # 如果批次失败了 → 标记为失败
             queue_df.at[idx, '状态'] = '已处理'  # 默认已处理(AI认为无人名)
+            queue_df.at[idx, 'AI提取姓名'] = '(无)'
+            # 加入 ai_map 以便后续清理 result.csv 中的 flag
+            ai_map[sid] = {'name': '', 'role': row['角色']}
 
     # 保存更新后的队列
     queue_df.to_csv(str(queue_csv), index=False, encoding='utf-8-sig')
@@ -502,7 +498,7 @@ def cmd_phase2(args):
         print(f'\n  合并完成: 更新 {merged} 行，新增 {new} 行')
 
     # 统计
-    updated_queue = pd.read_csv(str(queue_csv), encoding='utf-8-sig')
+    updated_queue = pd.read_csv(str(queue_csv), encoding='utf-8-sig', low_memory=False)
     total = len(updated_queue)
     done = len(updated_queue[updated_queue['状态'] == '已处理'])
     failed = len(updated_queue[updated_queue['状态'] == '失败'])
@@ -533,7 +529,7 @@ def cmd_retry(args):
         print('[ERROR] 未找到 AI 队列文件')
         sys.exit(1)
 
-    queue_df = pd.read_csv(str(queue_csv), encoding='utf-8-sig')
+    queue_df = pd.read_csv(str(queue_csv), encoding='utf-8-sig', dtype={'AI提取姓名': str}, low_memory=False)
     failed = queue_df[queue_df['状态'] == '失败']
 
     if len(failed) == 0:
@@ -544,12 +540,16 @@ def cmd_retry(args):
         return
 
     file_label = str(failed.iloc[0]['文件'])
+    
+    # 使用同一个日志文件
+    log_file = queue_csv.parent / f"{queue_csv.stem}_ai_log.txt"
 
     print(f"\n{'='*60}")
     print(f"  Retry: 重试失败片段")
     print(f"{'='*60}")
     print(f"  队列文件 : {queue_csv}")
     print(f"  结果文件 : {result_csv}")
+    print(f"  日志文件 : {log_file}")
     print(f"  失败片段 : {len(failed)} 条\n")
 
     snippets = []
@@ -561,17 +561,28 @@ def cmd_retry(args):
         })
 
     config = Config()
-    ai_map = _ai_batch_extract(snippets, config)
+    
+    # 响应详情输出目录
+    response_dir = log_file.parent / "ai_responses"
+    
+    ai_map = _ai_batch_extract(snippets, config, log_file, response_dir)
 
-    # 更新状态
+    # 更新状态和AI提取姓名
     processed_ids = set(ai_map.keys())
+    
+    # 确保'AI提取姓名'列存在
+    if 'AI提取姓名' not in queue_df.columns:
+        queue_df['AI提取姓名'] = ''
+    
     for idx, row in queue_df.iterrows():
         sid = str(row['snippet_id'])
         if row['状态'] == '失败':
             if sid in processed_ids:
                 queue_df.at[idx, '状态'] = '已处理'
+                queue_df.at[idx, 'AI提取姓名'] = ai_map[sid]['name']
             else:
                 queue_df.at[idx, '状态'] = '已处理'  # AI返回null也算处理了
+                queue_df.at[idx, 'AI提取姓名'] = '(无)'
 
     queue_df.to_csv(str(queue_csv), index=False, encoding='utf-8-sig')
 
@@ -596,21 +607,31 @@ def cmd_status(args):
     print(f'  处理状态总览')
     print(f'{"="*60}')
 
-    # Phase 1 进度
-    db_path = output_dir / 'progress.sqlite'
-    if db_path.exists():
-        db = ProgressDB(str(db_path))
-        stats = db.get_stats()
+    # Phase 1 进度（基于 CSV 统计）
+    results = list(output_dir.glob('*_result.csv'))
+    if results:
         print(f'\n  Phase 1 (规则提取):')
-        print(f'    已完成      : {stats["done"]:>8,}')
-        print(f'    待AI处理    : {stats["pending_ai"]:>8,}')
-        print(f'    无角色词    : {stats["no_signature"]:>8,}')
-        print(f'    合计        : {stats["total"]:>8,}')
+        for r in results:
+            df = pd.read_csv(str(r), encoding='utf-8-sig', low_memory=False)
+            total = len(df)
+            pending_ai = 0
+            no_signature = 0
+            if 'flag' in df.columns:
+                flags = df['flag'].fillna('')
+                pending_ai = flags.str.startswith('需要AI处理').sum()
+                no_signature = (flags == 'NA').sum()
+            done = total - pending_ai - no_signature
+            print(f'    {r.name}:')
+            print(f'      已完成   : {done:>8,}')
+            print(f'      待AI处理 : {pending_ai:>8,}')
+            print(f'      无角色词 : {no_signature:>8,}')
+            print(f'      合计     : {total:>8,}')
+    else:
+        print(f'\n  Phase 1 (规则提取): 未找到结果文件')
 
     # Result CSV
-    results = list(output_dir.glob('*_result.csv'))
     for r in results:
-        df = pd.read_csv(str(r), encoding='utf-8-sig')
+        df = pd.read_csv(str(r), encoding='utf-8-sig', low_memory=False)
         if '来源' in df.columns:
             src_dist = df['来源'].value_counts()
             print(f'\n  结果文件: {r.name} ({len(df)} 行)')
@@ -622,7 +643,7 @@ def cmd_status(args):
     # AI Queue
     queues = list(output_dir.glob('*_ai_queue.csv'))
     for q in queues:
-        qdf = pd.read_csv(str(q), encoding='utf-8-sig')
+        qdf = pd.read_csv(str(q), encoding='utf-8-sig', low_memory=False)
         print(f'\n  AI队列: {q.name} ({len(qdf)} 条)')
         if '状态' in qdf.columns:
             st_dist = qdf['状态'].value_counts()

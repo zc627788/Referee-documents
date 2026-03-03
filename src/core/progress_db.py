@@ -130,6 +130,14 @@ class ProgressDB:
         stats['total'] = sum(stats.values())
         return stats
 
+    def get_processed_indices(self, file_name: str) -> set:
+        """一次性拉取已处理行号，避免逐行查询。"""
+        rows = self._conn().execute(
+            "SELECT row_index FROM progress WHERE file_name=?",
+            (file_name,)
+        ).fetchall()
+        return {r['row_index'] for r in rows}
+
     def close(self):
         if hasattr(self._local, 'conn') and self._local.conn:
             self._local.conn.close()
